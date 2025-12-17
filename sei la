@@ -1,0 +1,116 @@
+import http.server
+import socketserver
+import urllib.parse
+import json
+import os
+import time
+import threading
+
+DB_FILE = "db.json"
+HOST = "0.0.0.0"  # necessário para aceitar conexões externas
+PORT = int(os.getenv("PORT", 8000))  # usa porta definida pelo serviço
+
+ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+def base62_encode(n: int) -> str:
+    if n == 0:
+        return ALPHABET[0]
+    s = []
+    base = len(ALPHABET)
+    while n > 0:
+        n, r = divmod(n, base)
+        s.append(ALPHABET[r])
+    return "".join(reversed(s))
+
+def load_db():
+    if not os.path.exists(DB_FILE):
+        return {"counter": 1000, "urls": {}}
+    with open(DB_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_db(db):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+
+DB_LOCK = threading.Lock()
+
+class ShortenerHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path.lstrip("/")
+        params = urllib.parse.parse_qs(parsed.query)
+
+        # Página inicial para evitar "Application Loading"
+        if path == "":
+            return self.respond_text(
+                "✅ Servidor ativo!\n\n"
+                "Rotas disponíveis:\n"
+                "  /new?url=<URL>        -> cria link curto\n"
+                "  /newwa?numero=...&texto=... -> cria link curto para WhatsApp\n"
+                "  /list                 -> lista todos os links\n"
+            )
+
+        # Criação de link genérico
+        if path == "new":
+            url = params.get("url", [None])[0]
+            if not url:
+                return self.respond_text("Erro: parâmetro 'url' é obrigatório.", status=400)
+
+            url = url.strip()
+            if not (url.startswith("http://") or url.startswith("https://")):
+                return self.respond_text("Erro: a URL deve começar com http:// ou https://", status=400)
+
+            # Bloqueia URLs internas
+            parsed_url = urllib.parse.urlparse(url)
+            if parsed_url.hostname in {"localhost", "127.0.0.1"}:
+                return self.respond_text("Erro: não é permitido encurtar URLs internas.", status=400)
+
+            with DB_LOCK:
+                db = load_db()
+                for code, entry in db["urls"].items():
+                    if entry["url"] == url:
+                        short = f"http://{HOST}:{PORT}/{code}"
+                        self.send_response(303)
+                        self.send_header("Location", short)
+                        self.end_headers()
+                        return
+
+                db["counter"] += 1
+                code = base62_encode(db["counter"])
+                db["urls"][code] = {"url": url, "created_at": time.time(), "hits": 0}
+                save_db(db)
+                short = f"http://{HOST}:{PORT}/{code}"
+
+            self.send_response(303)
+            self.send_header("Location", short)
+            self.end_headers()
+            return
+
+        # Criação de link para WhatsApp
+        if path == "newwa":
+            numero = params.get("numero", [None])[0]
+            texto = params.get("texto", [None])[0]
+            if not numero or not texto:
+                return self.respond_text("Uso: /newwa?numero=<DDI+DDD+numero>&texto=<mensagem>", status=400)
+
+            texto_enc = urllib.parse.quote(texto, safe="")
+            wa_url = f"https://wa.me/{numero}?text={texto_enc}"
+
+            with DB_LOCK:
+                db = load_db()
+                for code, entry in db["urls"].items():
+                    if entry["url"] == wa_url:
+                        short = f"http://{HOST}:{PORT}/{code}"
+                        self.send_response(303)
+                        self.send_header("Location", short)
+                        self.end_headers()
+                        return
+
+                db["counter"] += 1
+                code = base62_encode(db["counter"])
+                db["urls"][code] = {"url": wa_url, "created_at": time.time(), "hits": 0}
+                save_db(db)
+                short = f"http://{HOST}:{PORT}/{code}"
+
+            self.send_response(303)
+            self.send_header("Location", short)
